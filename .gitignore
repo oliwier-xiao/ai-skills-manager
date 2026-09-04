@@ -1,0 +1,14 @@
+# Local development only — the live copy is made by dev-sync.sh
+*.log
+*.swp
+*~
+.DS_Store
+__pycache__/
+*.pyc
+# oh-my-openagent leaves this behind wherever it runs, this repo included
+.omo/
+# A symlink into the codegraph index. The marketplace validator refuses a symlink
+# anywhere in a plugin folder.
+.codegraph
+# Exported agent-session transcripts, dropped in the repo root by hand.
+session-*.md
