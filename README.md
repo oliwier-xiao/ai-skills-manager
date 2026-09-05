@@ -14,8 +14,37 @@ invoke it on your clipboard, and the upstream it came from when there is one to 
 
 ## Status
 
-Early. The research is done and the design is settled; the code is being written. Nothing here is
-installable yet — this notice comes down when it is.
+Early. The design is settled and written down in [docs/DESIGN.md](docs/DESIGN.md); the decisions that
+shaped it are in [docs/DECISIONS.md](docs/DECISIONS.md). The inventory backend works and is worth running
+on its own — the panel is not built yet, so nothing is installable as a widget. This notice comes down
+when it is.
+
+```
+$ bin/agent-ext doctor
+agent-ext 0.1.0   scan 18.9 ms
+skills            39
+  claude          15   ~1179 tok always on
+  codex            9   ~1035 tok always on
+  opencode        33   ~4296 tok always on
+mcp servers       7
+claude plugins    1
+categories        automation 16, agents 5, code 4, system 3, content 2, design 2, ...
+```
+
+`bin/agent-ext scan` prints the same inventory as one line of JSON. It needs python3 and nothing else.
+
+## What it already finds
+
+Three of these are on the author's own machine, and no other tool reports any of them:
+
+- **The same skill loaded twice, differing.** `omarchy` exists as a real directory under
+  `~/.claude/skills` and as a symlink to `/usr/share/omarchy` under `~/.codex/skills`. The two files are
+  not the same. Claude Code and OpenCode read one, Codex reads the other, and nothing says so.
+  Deduplicating on path alone calls them unrelated; on name alone, identical. Both are wrong.
+- **One skill, three agents, five mount points.** `diagnose-crash` is a single `SKILL.md` reachable from
+  `~/.claude/skills`, `~/.codex/skills` and `~/.agents/skills`. It is one row, not five.
+- **Frontmatter that is not valid YAML.** `n8n-sdk-server` writes `Triggers on:` inside an unquoted
+  scalar. A strict parser drops the entire frontmatter and reports a 162-token skill as costing 4.
 
 ## What it will do
 

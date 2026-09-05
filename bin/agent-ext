@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""agent-ext — the only part of Agent Extensions that touches the filesystem.
+
+One line of JSON on stdout, diagnostics on stderr. The QML reads and draws; it does
+no I/O of its own beyond spawning this. Every subcommand is runnable by hand, which
+is the point: an action you cannot reproduce in a terminal is one you cannot debug.
+
+Exit codes: 0 done · 1 usage error · 2 refused, nothing written · 3 partial write, restored.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import hashlib
+import json
+import math
+import os
+import stat
+import sys
+import time
+
+VERSION = "0.1.0"
+HOME = os.path.expanduser("~")
+
+# A skill's SKILL.md is prose. Anything larger than this is not a skill, it is a
+# mistake or an attack, and we refuse to read it into memory to find out which.
+MAX_READ = 1024 * 1024
+FRONTMATTER_LIMIT = 64 * 1024
+
+
+# ---------------------------------------------------------------- safe reading
+
+def safe_read(path: str, *, max_bytes: int = MAX_READ) -> bytes | None:
+    """Read a regular file we own, refusing symlinks at the final component.
+
+    O_NOFOLLOW so a swapped symlink cannot redirect us, O_NONBLOCK so a fifo
+    cannot hang the panel, and fstat on the descriptor rather than stat on the
+    name so the thing we checked is the thing we read.
+    """
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        # Root-owned files are the packaged system skills (Omarchy ships its own
+        # under /usr/share). Refusing them would silently drop every distro skill.
+        # What we refuse is a file owned by some other unprivileged user.
+        if st.st_uid not in (os.getuid(), 0):
+            return None
+        if st.st_size > max_bytes:
+            return None
+        os.set_blocking(fd, True)
+        return os.read(fd, max_bytes)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ELOOP, errno.EACCES, errno.ENOTDIR, errno.EAGAIN):
+            warn(f"read {path}: {exc}")
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def read_text(path: str, *, max_bytes: int = MAX_READ) -> str | None:
+    raw = safe_read(path, max_bytes=max_bytes)
+    if raw is None:
+        return None
+    return raw.decode("utf-8", "replace")
+
+
+def read_json(path: str) -> tuple[dict | list | None, str | None]:
+    """Returns (value, error). A malformed config is a finding, not a crash."""
+    txt = read_text(path)
+    if txt is None:
+        return None, None
+    if not txt.strip():
+        return None, "empty"
+    try:
+        return json.loads(txt), None
+    except json.JSONDecodeError as exc:
+        return None, f"invalid json at line {exc.lineno}"
+
+
+def read_toml(path: str) -> tuple[dict | None, str | None]:
+    raw = safe_read(path)
+    if raw is None:
+        return None, None
+    try:
+        import tomllib
+        return tomllib.loads(raw.decode("utf-8", "replace")), None
+    except Exception as exc:  # noqa: BLE001 - any parse failure is one finding
+        return None, f"invalid toml: {exc}"
+
+
+def warn(msg: str) -> None:
+    print(f"agent-ext: {msg}", file=sys.stderr)
+
+
+def tilde(path: str) -> str:
+    return "~" + path[len(HOME):] if path.startswith(HOME + "/") else path
+
+
+# ------------------------------------------------------------- frontmatter
+
+def parse_frontmatter(text: str) -> dict:
+    """YAML frontmatter, with a hand-rolled fallback.
+
+    PyYAML is used when present but is NOT assumed: it is not in the Omarchy base
+    package set. The fallback handles what actually appears in skill files —
+    plain scalars, quoted scalars, block scalars (| and >), and one level of
+    nested mapping, which is how `metadata:` is written in the wild.
+
+    A line-oriented `^description:` regex is specifically not enough. Three of
+    this machine's own skills (omarchy, diagnose-crash, security-fortress) write
+    their description as a multi-line scalar, and a regex reports their token
+    cost as 2 to 5 instead of 150, 122 and 123.
+
+    PyYAML is deliberately NOT used even where it is installed. It is absent from
+    the Omarchy base package set, so half the users would take a different code
+    path from the other half and see different token counts for the same skill —
+    and a displayed cost that depends on an optional dependency is worse than a
+    slightly simpler parser. It would also lose files outright: this machine's
+    n8n-sdk-server writes `Triggers on:` inside an unquoted scalar, which is
+    invalid YAML, and PyYAML drops the whole frontmatter rather than the one
+    field, reporting a 162-token skill as costing 4.
+    """
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    block = text[text.find("\n") + 1:end]
+    if len(block) > FRONTMATTER_LIMIT:
+        return {}
+    return parse_frontmatter_block(block)
+
+
+def parse_frontmatter_block(block: str) -> dict:
+    out: dict = {}
+    lines = block.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip() or line.lstrip().startswith("#") or line[:1].isspace():
+            i += 1
+            continue
+        if ":" not in line:
+            i += 1
+            continue
+        key, _, rest = line.partition(":")
+        key = key.strip()
+        rest = rest.strip()
+        if rest in ("|", ">", "|-", ">-", "|+", ">+"):
+            folded = rest[0] == ">"
+            body, i = _consume_indented(lines, i + 1)
+            out[key] = (" ".join(x.strip() for x in body) if folded else "\n".join(body)).strip()
+            continue
+        if rest == "":
+            body, j = _consume_indented(lines, i + 1)
+            if body:
+                nested = {}
+                for sub in body:
+                    if ":" in sub:
+                        k2, _, v2 = sub.partition(":")
+                        nested[k2.strip()] = _unquote(v2.strip())
+                out[key] = nested
+                i = j
+                continue
+            out[key] = ""
+            i += 1
+            continue
+        # A plain scalar may still continue onto following indented lines.
+        cont, j = _consume_indented(lines, i + 1)
+        value = rest if not cont else rest + " " + " ".join(x.strip() for x in cont)
+        out[key] = _unquote(value.strip())
+        i = j if cont else i + 1
+    return out
+
+
+def has_unquoted_colon(block: str) -> bool:
+    """True when a plain scalar carries a bare `: `, which is invalid YAML.
+
+    We read such a file anyway, but a stricter agent may drop the whole
+    frontmatter, so the row is worth marking.
+    """
+    for line in block.split("\n"):
+        if not line or line[:1].isspace() or line.lstrip().startswith("#"):
+            continue
+        _, sep, rest = line.partition(":")
+        if not sep:
+            continue
+        rest = rest.strip()
+        if not rest or rest[:1] in "\"'|>":
+            continue
+        if ": " in rest:
+            return True
+    return False
+
+
+def _consume_indented(lines: list[str], start: int) -> tuple[list[str], int]:
+    body: list[str] = []
+    i = start
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() and not line[:1].isspace():
+            break
+        body.append(line.strip() if line.strip() else "")
+        i += 1
+    while body and not body[-1]:
+        body.pop()
+    return body, i
+
+
+def _unquote(v: str) -> str:
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    return v
+
+
+# ------------------------------------------------------------------ taxonomy
+
+CATEGORIES = [
+    "agents", "code", "workflow", "web", "design", "media", "data",
+    "infra", "ops", "security", "automation", "content", "business", "system",
+]
+
+GLYPH = {
+    "agents": "◇", "code": "⌘", "workflow": "⎇", "web": "▫",
+    "design": "✧", "media": "▶", "data": "▤", "infra": "☁",
+    "ops": "◉", "security": "⛨", "automation": "⟳", "content": "✎",
+    "business": "₿", "system": "⚙",
+}
+
+# Official marketplace category -> ours. Tier 2 of the cascade.
+OFFICIAL_MAP = {
+    "development": "code", "productivity": "workflow", "database": "data",
+    "monitoring": "ops", "security": "security", "deployment": "infra",
+    "design": "design", "automation": "automation", "learning": "content",
+    "location": "system", "testing": "code", "migration": "infra", "math": "content",
+}
+
+# Tier 5. Specific categories outrank general ones; `agents` is the residual and
+# scores last and lowest, because nearly every description in this ecosystem
+# mentions skills or models or prompts.
+RULES: list[tuple[str, int, tuple[str, ...]]] = [
+    ("system", 4, ("hyprland", "omarchy", "waybar", "window manager", "desktop", "arch linux",
+                   "systemd", "shell config", "dotfiles", "keybinding", "wayland", "coredump",
+                   "crash", "segfault", "kernel", "embedded", "firmware", "game engine", "godot")),
+    ("media", 4, ("video", "audio", "image gen", "animation", "animate", "3d", "three.js", "webgl",
+                  "shader", "render", "ffmpeg", "music", "photo", "motion graphics", "gltf")),
+    ("design", 4, ("design system", "ui design", "ux", "figma", "typography", "accessibility",
+                   "visual hierarchy", "brand", "color palette", "landing page", "wireframe")),
+    ("security", 4, ("vulnerabilit", "owasp", "penetration", "exploit", "cve", "xss", "csrf",
+                     "authentication", "authorization", "compliance", "secrets", "audit")),
+    ("ops", 4, ("monitoring", "observability", "logs", "tracing", "metrics", "incident",
+                "alerting", "uptime", "sentry", "grafana", "prometheus")),
+    ("automation", 4, ("n8n", "zapier", "make.com", "workflow automation", "scraping", "scrape",
+                       "cron", "webhook", "browser automation", "playwright", "puppeteer", "rpa")),
+    ("data", 4, ("database", "postgres", "mysql", "sqlite", "migration", "sql", "orm", "prisma",
+                 "vector store", "embedding", "warehouse", "etl", "analytics", "bigquery")),
+    ("infra", 4, ("docker", "kubernetes", "terraform", "deploy", "ci/cd", "pipeline", "aws",
+                  "gcp", "azure", "container", "helm", "nginx", "serverless", "infrastructure")),
+    ("business", 4, ("payment", "stripe", "invoice", "billing", "crm", "erp", "commerce",
+                     "legal", "contract", "finance", "accounting", "tax")),
+    ("content", 3, ("seo", "marketing", "copywriting", "blog", "newsletter", "documentation",
+                    "latex", "obsidian", "note-taking", "knowledge base", "research", "citation")),
+    ("web", 3, ("react", "next.js", "nextjs", "vue", "svelte", "tailwind", "frontend",
+                "app router", "server component", "css", "html", "browser", "mobile app")),
+    ("code", 3, ("refactor", "test-driven", "unit test", "debug", "lint", "type safety",
+                 "code review", "performance", "profiling", "lsp", "api design", "rest api")),
+    ("workflow", 3, ("git ", "pull request", "commit", "changelog", "release", "issue",
+                     "planning", "specification", "roadmap", "branch")),
+    ("agents", 2, ("skill", "mcp", "prompt", "agent", "llm", "claude", "context window",
+                   "eval", "subagent", "tool use")),
+]
+
+# Without these, `api-design` scores `design` on the literal word and lands wrong.
+NEGATIVE = {
+    "design": ("api design", "schema design", "database design", "system design",
+               "api-design", "designing or reviewing rest"),
+}
+
+TAG_RULES = {
+    "nextjs": ("next.js", "nextjs", "app router"), "react": ("react",),
+    "seo": ("seo",), "video": ("video",), "animations": ("animation", "animate", "motion"),
+    "ui": ("ui ", "user interface", "design system"), "3d": ("three.js", "webgl", "3d"),
+    "docker": ("docker", "container"), "n8n": ("n8n",), "postgres": ("postgres",),
+    "tdd": ("test-driven", "tdd"), "latex": ("latex",), "mcp": ("mcp",),
+}
+
+
+def classify(name: str, description: str, path: str, official: str | None) -> dict:
+    if official and official in OFFICIAL_MAP:
+        return {"category": OFFICIAL_MAP[official], "confidence": "high", "classifier": "marketplace"}
+
+    base = os.path.basename(path)
+    if "/skills/.system" in path or "/.system/" in path:
+        return {"category": "agents", "confidence": "medium", "classifier": "path"}
+    if base.startswith("n8n-"):
+        return {"category": "automation", "confidence": "medium", "classifier": "path"}
+
+    hay = f"{name} {description}".lower()
+    scores: dict[str, int] = {}
+    for cat, weight, needles in RULES:
+        if any(neg in hay for neg in NEGATIVE.get(cat, ())):
+            continue
+        hits = sum(1 for n in needles if n in hay)
+        if hits:
+            scores[cat] = scores.get(cat, 0) + hits * weight
+    if not scores:
+        return {"category": "agents", "confidence": "unclassified", "classifier": "none"}
+    # Tie-break by position in RULES, not in CATEGORIES. `agents` is the residual
+    # bucket and sits last in the rule table precisely so that it loses ties; on
+    # CATEGORIES order it sits first and would win them, which is how a skill
+    # whose description says "n8n workflow" eleven times classifies as `agents`.
+    order = {cat: i for i, (cat, _, _) in enumerate(RULES)}
+    ranked = sorted(scores.items(), key=lambda kv: (-kv[1], order.get(kv[0], 99)))
+    top, top_score = ranked[0]
+    runner = ranked[1][1] if len(ranked) > 1 else 0
+    if top_score >= 10 and (top_score - runner) >= 4:
+        conf = "high"
+    elif top_score >= 6:
+        conf = "medium"
+    else:
+        conf = "low"
+    return {"category": top, "confidence": conf, "classifier": "keywords"}
+
+
+def tags_for(name: str, description: str) -> list[str]:
+    hay = f"{name} {description}".lower()
+    return sorted(t for t, needles in TAG_RULES.items() if any(n in hay for n in needles))
+
+
+# ------------------------------------------------------------------- roots
+
+def skill_roots() -> list[dict]:
+    """Every directory the three agents look in, and which of them look there.
+
+    OpenCode reads Claude Code's and the shared ~/.agents directories natively
+    unless OPENCODE_DISABLE_EXTERNAL_SKILLS is set; Claude Code reads neither of
+    the other two. That asymmetry is why `tools` is a list per root rather than
+    one tool per path.
+    """
+    oc_external = not os.environ.get("OPENCODE_DISABLE_EXTERNAL_SKILLS")
+    claude_tools = ["claude"] + (["opencode"] if oc_external else [])
+    agents_tools = ["codex"] + (["opencode"] if oc_external else [])
+    return [
+        {"path": f"{HOME}/.claude/skills", "tools": claude_tools, "scope": "user"},
+        {"path": f"{HOME}/.config/opencode/skills", "tools": ["opencode"], "scope": "user"},
+        {"path": f"{HOME}/.codex/skills", "tools": ["codex"], "scope": "user"},
+        {"path": f"{HOME}/.agents/skills", "tools": agents_tools, "scope": "shared"},
+    ]
+
+
+def token_estimate(name: str, description: str, when_to_use: str, divisor: int = 4) -> int:
+    joined = " ".join(x for x in (name, description, when_to_use) if x)
+    # math.floor(x + 0.5), not round(): Python rounds halves to even, JavaScript
+    # rounds them up, and the figure we are matching was produced by JavaScript.
+    # latex-engineer lands on exactly 66.5 and the difference is visible.
+    return math.floor(len(joined) / divisor + 0.5)
+
+
+# -------------------------------------------------------------------- scan
+
+def scan(divisor: int = 4) -> dict:
+    started = time.monotonic()
+    findings: list[dict] = []
+    by_real: dict[str, dict] = {}
+
+    claude_settings, err = read_json(f"{HOME}/.claude/settings.json")
+    if err:
+        findings.append({"what": "claude settings.json", "detail": err})
+    overrides = (claude_settings or {}).get("skillOverrides") or {}
+
+    claude_state, err = read_json(f"{HOME}/.claude.json")
+    if err:
+        findings.append({"what": "claude.json", "detail": err})
+    usage = (claude_state or {}).get("skillUsage") or {}
+
+    catalog_cat = _catalog_categories()
+
+    for root in skill_roots():
+        base = root["path"]
+        try:
+            entries = sorted(os.scandir(base), key=lambda e: e.name)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name.startswith("."):
+                if entry.name != ".system":
+                    continue
+            if not (entry.is_dir(follow_symlinks=True) or entry.is_symlink()):
+                continue
+            if entry.name == ".system":
+                for sub in sorted(os.scandir(entry.path), key=lambda e: e.name):
+                    if sub.is_dir(follow_symlinks=True):
+                        _ingest(by_real, sub.path, base, root, overrides, usage,
+                                catalog_cat, divisor, findings, bundled=True)
+                continue
+            _ingest(by_real, entry.path, base, root, overrides, usage,
+                    catalog_cat, divisor, findings)
+
+    items = list(by_real.values())
+    _mark_drift(items)
+    items.sort(key=lambda r: (r["taxonomy"]["category"], r["dirName"].lower()))
+    return {
+        "version": VERSION,
+        "generatedAt": int(time.time()),
+        "elapsedMs": round((time.monotonic() - started) * 1000, 1),
+        "items": items,
+        "mcp": scan_mcp(findings),
+        "plugins": scan_claude_plugins(findings),
+        "findings": findings,
+        "counts": _counts(items),
+    }
+
+
+def _ingest(by_real, dir_path, base, root, overrides, usage, catalog_cat,
+            divisor, findings, bundled=False):
+    skill_md = os.path.join(dir_path, "SKILL.md")
+    real = os.path.realpath(dir_path)
+    mount_path = tilde(dir_path)
+    is_link = os.path.islink(dir_path)
+
+    existing = by_real.get(real)
+    if existing is not None:
+        for tool in root["tools"]:
+            if not any(m["tool"] == tool and m["path"] == mount_path for m in existing["mounts"]):
+                existing["mounts"].append(
+                    {"tool": tool, "path": mount_path, "link": "symlink" if is_link else "real"})
+            # One file reachable from several roots is one skill in several tools.
+            # diagnose-crash is a single SKILL.md that all three agents load, and
+            # a `tools` list left at whichever root was scanned first would hide
+            # two of them.
+            if tool not in existing["tools"]:
+                existing["tools"].append(tool)
+                existing["state"].update(
+                    _skill_state(existing["dirName"], [tool], overrides,
+                                 existing["flags"]["builtin"]))
+        return
+
+    text = read_text(skill_md)
+    if text is None:
+        if not os.path.exists(skill_md):
+            findings.append({"what": tilde(dir_path),
+                             "detail": "broken symlink" if is_link and not os.path.exists(real)
+                             else "directory without SKILL.md"})
+        return
+
+    fm = parse_frontmatter(text)
+    dir_name = os.path.basename(dir_path)
+    display = str(fm.get("name") or dir_name)
+    description = str(fm.get("description") or "").replace("\n", " ").strip()
+    when_to_use = str(fm.get("when_to_use") or "").replace("\n", " ").strip()
+
+    attention: list[str] = []
+    if display != dir_name:
+        attention.append("name-mismatch")
+    if not description:
+        attention.append("no-description")
+    if len(description) > 1024:
+        attention.append("long-description")
+    fm_end = text.find("\n---", 3)
+    if fm_end != -1 and has_unquoted_colon(text[text.find("\n") + 1:fm_end]):
+        attention.append("invalid-yaml")
+
+    meta = fm.get("metadata") if isinstance(fm.get("metadata"), dict) else {}
+    tax = classify(display, description, dir_path, catalog_cat.get(dir_name))
+    if meta.get("agent-ext.category") in CATEGORIES:
+        tax = {"category": meta["agent-ext.category"], "confidence": "authored",
+               "classifier": "frontmatter"}
+    if tax["confidence"] == "unclassified":
+        attention.append("unclassified")
+    elif tax["confidence"] == "low":
+        attention.append("low-confidence")
+
+    u = usage.get(dir_name) or usage.get(display) or {}
+    last = u.get("lastUsedAt")
+    record = {
+        "key": f"skill:{real}",
+        "realPath": real,
+        "contentHash": "sha256:" + hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16],
+        "kind": "skill",
+        "displayName": display,
+        "dirName": dir_name,
+        "description": description,
+        "scope": "bundled" if bundled else root["scope"],
+        "linkage": "symlink" if is_link else "real",
+        "mounts": [{"tool": t, "path": mount_path, "link": "symlink" if is_link else "real"}
+                   for t in root["tools"]],
+        "tools": list(root["tools"]),
+        "state": _skill_state(dir_name, root["tools"], overrides, bundled),
+        "invocation": {"claude": f"/{dir_name}", "opencode": f"/{display}", "codex": f"${display}"},
+        "argumentHint": fm.get("argument-hint"),
+        "tokens": {"alwaysOn": token_estimate(dir_name, description, when_to_use, divisor),
+                   "method": f"chars/{divisor}"},
+        "usage": {"count": u.get("usageCount", 0), "lastUsedAt": last,
+                  "daysSinceUse": (int((time.time() * 1000 - last) / 86400000) if last else None),
+                  "source": "claude.json" if u else "not tracked"},
+        "taxonomy": {**tax, "tags": tags_for(display, description),
+                     "glyph": GLYPH[tax["category"]]},
+        "origin": {"type": "none", "url": None, "confidence": "unknown"},
+        "update": {"state": "unknown"},
+        "attention": attention,
+        "flags": {"builtin": bundled, "readOnly": bundled, "pluginProvided": False},
+    }
+    by_real[real] = record
+
+
+def _mark_drift(items: list[dict]) -> None:
+    """Flag skills that share a name but not their content.
+
+    Deduplicating on realpath alone reports these as unrelated; on name alone, as
+    identical. Both are wrong, and "same name, different content, both loaded" is
+    a real state on this machine: ~/.claude/skills/omarchy is a copy that has
+    drifted from the /usr/share original the other tools read.
+    """
+    by_name: dict[str, list[dict]] = {}
+    for it in items:
+        by_name.setdefault(it["dirName"], []).append(it)
+    for group in by_name.values():
+        if len(group) < 2:
+            continue
+        if len({it["contentHash"] for it in group}) == 1:
+            continue
+        for it in group:
+            if "drift" not in it["attention"]:
+                it["attention"].append("drift")
+            it["driftPeers"] = [p["realPath"] for p in group if p is not it]
+
+
+def _skill_state(dir_name, tools, overrides, bundled):
+    state = {}
+    if "claude" in tools:
+        state["claude"] = {
+            "value": overrides.get(dir_name, "on"),
+            "ladder": ["on", "name-only", "user-invocable-only", "off"],
+            "writable": not bundled,
+            "file": tilde(f"{HOME}/.claude/settings.json"),
+        }
+    if "opencode" in tools:
+        state["opencode"] = {"value": "allow", "writable": not bundled,
+                             "file": tilde(f"{HOME}/.config/opencode/opencode.json")}
+    if "codex" in tools:
+        state["codex"] = {"value": "enabled", "writable": not bundled, "needsRestart": True,
+                          "file": tilde(f"{HOME}/.codex/config.toml")}
+    return state
+
+
+def _catalog_categories() -> dict:
+    data, _ = read_json(f"{HOME}/.claude/plugins/plugin-catalog-cache.json")
+    out: dict[str, str] = {}
+    if not isinstance(data, dict):
+        return out
+    for entry in (data.get("catalog", {}).get("plugins") or {}).values():
+        me = entry.get("marketplace_entry") or {}
+        if me.get("name") and me.get("category"):
+            out[me["name"]] = me["category"]
+    return out
+
+
+# --------------------------------------------------------------------- MCP
+
+def scan_mcp(findings: list[dict]) -> list[dict]:
+    servers: list[dict] = []
+
+    oc, err = read_json(f"{HOME}/.config/opencode/opencode.json")
+    if err:
+        findings.append({"what": "opencode.json", "detail": err})
+    for name, cfg in ((oc or {}).get("mcp") or {}).items():
+        servers.append({
+            "kind": "mcp", "tool": "opencode", "name": name,
+            "transport": cfg.get("type", "local"),
+            "target": cfg.get("url") or " ".join(cfg.get("command") or []),
+            "enabled": cfg.get("enabled", True), "scope": "user",
+            "auth": _opencode_auth(name), "writable": False,
+        })
+
+    cx, err = read_toml(f"{HOME}/.codex/config.toml")
+    if err:
+        findings.append({"what": "codex config.toml", "detail": err})
+    for name, cfg in ((cx or {}).get("mcp_servers") or {}).items():
+        servers.append({
+            "kind": "mcp", "tool": "codex", "name": name, "transport": "stdio",
+            "target": " ".join([cfg.get("command", "")] + list(cfg.get("args") or [])).strip(),
+            "enabled": cfg.get("enabled", True), "scope": "user",
+            "auth": "unknown", "writable": False,
+        })
+
+    state, _ = read_json(f"{HOME}/.claude.json")
+    for name, cfg in ((state or {}).get("mcpServers") or {}).items():
+        servers.append({
+            "kind": "mcp", "tool": "claude", "name": name,
+            "transport": cfg.get("type", "stdio"),
+            "target": cfg.get("url") or " ".join([cfg.get("command", "")] + list(cfg.get("args") or [])),
+            "enabled": True, "scope": "user", "auth": "unknown", "writable": False,
+        })
+
+    # claude.ai connectors are not on disk. Live state needs the API; the names
+    # survive offline in claudeAiMcpEverConnected, which is why this degrades to
+    # a greyed list rather than an empty one.
+    for name in (state or {}).get("claudeAiMcpEverConnected") or []:
+        servers.append({
+            "kind": "mcp", "tool": "claude", "name": name, "transport": "http",
+            "target": "", "enabled": None, "scope": "account",
+            "auth": "unknown", "writable": False, "source": "claudeAiMcpEverConnected",
+        })
+    return servers
+
+
+def _opencode_auth(name: str) -> str:
+    data, _ = read_json(f"{HOME}/.local/share/opencode/mcp-auth.json")
+    entry = (data or {}).get(name)
+    if not entry:
+        return "unknown"
+    expires = ((entry.get("tokens") or {}).get("expiresAt") or 0)
+    return "connected" if expires > time.time() else "expired"
+
+
+def scan_claude_plugins(findings: list[dict]) -> list[dict]:
+    installed, err = read_json(f"{HOME}/.claude/plugins/installed_plugins.json")
+    if err:
+        findings.append({"what": "installed_plugins.json", "detail": err})
+    settings, _ = read_json(f"{HOME}/.claude/settings.json")
+    enabled = (settings or {}).get("enabledPlugins") or {}
+    out = []
+    for pid, records in ((installed or {}).get("plugins") or {}).items():
+        for rec in records:
+            out.append({
+                "kind": "plugin", "tool": "claude", "name": pid,
+                "version": rec.get("version"), "scope": rec.get("scope", "user"),
+                "enabled": enabled.get(pid, True), "installPath": rec.get("installPath"),
+                "origin": {"type": "marketplace", "installedSha": rec.get("gitCommitSha")},
+                "writable": True,
+            })
+    return out
+
+
+def _counts(items: list[dict]) -> dict:
+    per_tool: dict[str, int] = {}
+    per_cat: dict[str, int] = {}
+    tokens: dict[str, int] = {}
+    for it in items:
+        for tool in it["tools"]:
+            per_tool[tool] = per_tool.get(tool, 0) + 1
+            if it["state"].get(tool, {}).get("value") not in ("off",):
+                tokens[tool] = tokens.get(tool, 0) + it["tokens"]["alwaysOn"]
+        cat = it["taxonomy"]["category"]
+        per_cat[cat] = per_cat.get(cat, 0) + 1
+    return {"skills": len(items), "perTool": per_tool, "perCategory": per_cat,
+            "alwaysOnTokens": tokens}
+
+
+# -------------------------------------------------------------------- main
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="agent-ext", description=__doc__.split("\n")[0])
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_scan = sub.add_parser("scan", help="full inventory across all three tools")
+    p_scan.add_argument("--divisor", type=int, default=4, choices=(3, 4),
+                        help="token estimate divisor (default 4, matching Claude Code)")
+    p_scan.add_argument("--pretty", action="store_true", help="indent the JSON")
+
+    sub.add_parser("doctor", help="human-readable health report on stdout")
+
+    args = ap.parse_args(argv)
+
+    if args.cmd == "scan":
+        result = scan(divisor=args.divisor)
+        json.dump(result, sys.stdout, indent=2 if args.pretty else None, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+
+    if args.cmd == "doctor":
+        result = scan()
+        c = result["counts"]
+        print(f"agent-ext {VERSION}   scan {result['elapsedMs']} ms")
+        print(f"skills            {c['skills']}")
+        for tool, n in sorted(c["perTool"].items()):
+            print(f"  {tool:<14}{n:>4}   ~{c['alwaysOnTokens'].get(tool, 0)} tok always on")
+        print(f"mcp servers       {len(result['mcp'])}")
+        print(f"claude plugins    {len(result['plugins'])}")
+        print("categories        " + ", ".join(
+            f"{k} {v}" for k, v in sorted(result["counts"]["perCategory"].items(),
+                                          key=lambda kv: -kv[1])))
+        if result["findings"]:
+            print(f"\nneeds attention   {len(result['findings'])}")
+            for f in result["findings"]:
+                print(f"  {f['what']}: {f['detail']}")
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

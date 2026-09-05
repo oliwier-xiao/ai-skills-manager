@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "id": "oliwier.ai-skills-manager",
+  "name": "Agent Extensions",
+  "version": "0.1.0",
+  "author": "oliwier-xiao",
+  "license": "MIT",
+  "description": "Every skill, plugin and MCP server your coding agents load, in one list. Claude Code, OpenCode and Codex each keep theirs in their own folders and none of them will tell you what the other two are loading — so this shows all of it at once: what is on, what it costs in tokens on every turn, what is quietly installed twice under two names, and what has drifted from the copy the other tool reads.",
+  "homepage": "https://github.com/oliwier-xiao/ai-skills-manager",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Agent Extensions",
+    "description": "Browse, search and switch the skills, plugins and MCP servers behind Claude Code, OpenCode and Codex.",
+    "category": "AI",
+    "aliases": [
+      "skills",
+      "agents",
+      "claude",
+      "opencode",
+      "codex",
+      "mcp"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "barLabel": "Nothing",
+      "groupBy": "Category",
+      "tokenModel": "chars/4",
+      "showBundled": false,
+      "confirmToggle": false,
+      "scanOnOpen": true
+    },
+    "schema": [
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Next to the bar icon",
+        "options": [
+          "Nothing",
+          "Always-on tokens",
+          "Skills enabled",
+          "Needs attention"
+        ],
+        "defaultValue": "Nothing",
+        "description": "Nothing is the default because this is a thing you open when you want it, not a number you watch — and an icon alone costs no width on a contested bar. Always-on tokens is the one figure worth watching: it is what every skill listing adds to every turn of every session, and it only moves when you turn something on. Skills enabled is the same idea counted in items instead of cost. Needs attention stays hidden until something is actually wrong, then shows the count."
+      },
+      {
+        "key": "groupBy",
+        "type": "enum",
+        "label": "Group the list by",
+        "options": [
+          "Category",
+          "Tool",
+          "Kind",
+          "Nothing"
+        ],
+        "defaultValue": "Category",
+        "description": "Category is the default because it answers the question you open the panel with — where is the thing that does X — and because the alternative buries it: sixteen of this machine's own skills are n8n workflow skills that would sit in one undifferentiated block under any other grouping. Tool is right when you are about to switch agents and want to know what that agent alone can see. Kind separates skills from plugins from MCP servers. Nothing gives one flat alphabetical list, which is the fastest thing to type-search through."
+      },
+      {
+        "key": "showBundled",
+        "type": "boolean",
+        "label": "Show built-in skills",
+        "defaultValue": false,
+        "description": "Each agent ships skills of its own — Claude Code has roughly eighteen that no filesystem scan can see, Codex has six under a directory it rewrites on every launch. They are on, you cannot turn them off, and you did not install them, so by default they are left out and only your own things are counted. Turn this on when you want the honest total of what a session is really carrying."
+      },
+      {
+        "key": "confirmToggle",
+        "type": "boolean",
+        "label": "Ask before switching something off",
+        "defaultValue": false,
+        "description": "Off is the fast path a bar widget exists for, and every toggle here is a one-key undo away. On is worth it if you share this machine, or if you have been bitten by turning off the skill that a running session was halfway through using."
+      },
+      {
+        "key": "tokenModel",
+        "type": "enum",
+        "label": "Estimate token cost as",
+        "options": [
+          "chars/4",
+          "chars/3",
+          "Hide"
+        ],
+        "defaultValue": "chars/4",
+        "description": "chars/4 is what Claude Code's own extensions browser shows, and it reproduces eleven of the fifteen figures on this machine exactly, so it is the number to match if you want the two to agree. chars/3 is closer to how newer models actually tokenise dense technical prose, and therefore closer to what you are really paying. Hide drops the column when you have decided the cost is not the thing you are managing."
+      },
+      {
+        "key": "scanOnOpen",
+        "type": "boolean",
+        "label": "Rescan every time the panel opens",
+        "defaultValue": true,
+        "description": "A full scan of four skill roots and every config file takes about thirty milliseconds, which is well under the time it takes the panel to draw, so this is on and the list is never stale. Turn it off only if you keep skills on a network mount, where a stat of every file is no longer free; the cached scan is then reused and refreshed in the background."
+      }
+    ]
+  }
+}
