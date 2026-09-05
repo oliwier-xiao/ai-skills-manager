@@ -100,7 +100,7 @@ Tests are plain `unittest` and need nothing that is not already here.
 python3 -m unittest discover -s tests -v
 ```
 
-`bin/preflight` checks this repository against the Omarchy plugin marketplace's published rules — the
+`tests/preflight.sh` checks this repository against the Omarchy plugin marketplace's published rules — the
 structural validator, the automated security baseline, and the recurring demands of its manual review —
 and exits non-zero on any violation. Run it before proposing a change.
 
