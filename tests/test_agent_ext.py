@@ -199,3 +199,65 @@ class TieBreak(unittest.TestCase):
         got = ax.classify("prompt-lab", "Prompt and eval tooling for subagent tool use.",
                           "/s/prompt-lab", None)
         self.assertEqual(got["category"], "agents")
+
+
+class AdversarialReads(unittest.TestCase):
+    """The cases the marketplace reviewer names explicitly. Each one used to take
+    the helper down with a traceback and an empty stdout."""
+
+    def test_a_fifo_does_not_block_the_shell(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "fifo")
+            os.mkfifo(p)
+            self.assertIsNone(ax.safe_read(p))
+
+    def test_a_hard_linked_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "real")
+            with open(real, "w", encoding="utf-8") as fh:
+                fh.write("x")
+            os.link(real, os.path.join(d, "second-name"))
+            self.assertIsNone(ax.safe_read(real))
+
+    def test_a_world_writable_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "loose")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("x")
+            os.chmod(p, 0o666)
+            self.assertIsNone(ax.safe_read(p))
+
+    def test_deeply_nested_json_is_a_finding_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "deep.json")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("[" * 200000 + "]" * 200000)
+            value, err = ax.read_json(p)
+            self.assertIsNone(value)
+            self.assertIsInstance(err, str)
+
+    def test_a_config_value_of_the_wrong_type_does_not_raise(self):
+        self.assertEqual(ax.as_dict("a string"), {})
+        self.assertEqual(ax.as_dict(None), {})
+        self.assertEqual(ax.as_list({"not": "a list"}), [])
+
+    def test_control_characters_are_stripped_before_they_reach_qml(self):
+        self.assertEqual(ax.clip("a\x00b\x1bc"), "abc")
+
+    def test_long_strings_are_capped(self):
+        self.assertEqual(len(ax.clip("x" * 5000, 100)), 100)
+
+
+class Redaction(unittest.TestCase):
+    def test_an_api_key_flag_is_masked(self):
+        self.assertNotIn("sk-live-DEADBEEF", ax.redact("npx pkg --api-key sk-live-DEADBEEF"))
+
+    def test_a_url_query_string_is_dropped(self):
+        self.assertEqual(ax.redact("https://h/mcp?token=abc"), "https://h/mcp?…")
+
+    def test_an_env_assignment_is_masked(self):
+        self.assertNotIn("sk-proj-XYZ", ax.redact("docker run -e OPENAI_API_KEY=sk-proj-XYZ img"))
+
+    def test_a_benign_command_is_left_alone(self):
+        cmd = "npx -y @modelcontextprotocol/server-filesystem /home/me"
+        self.assertEqual(ax.redact(cmd), cmd)

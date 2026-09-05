@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 import sys
 import time
@@ -27,6 +28,14 @@ HOME = os.path.expanduser("~")
 # mistake or an attack, and we refuse to read it into memory to find out which.
 MAX_READ = 1024 * 1024
 FRONTMATTER_LIMIT = 64 * 1024
+
+# Everything below bounds what can cross into the shell process. Quickshell runs
+# the whole desktop in one process and StdioCollector has no size cap of its own,
+# so the ceiling has to be here, on the producing side, before the bytes exist.
+MAX_OUTPUT = 2 * 1024 * 1024
+MAX_ITEMS = 2000
+MAX_DIR_ENTRIES = 2000
+DEADLINE_SECONDS = 20.0
 
 
 # ---------------------------------------------------------------- safe reading
@@ -42,17 +51,38 @@ def safe_read(path: str, *, max_bytes: int = MAX_READ) -> bytes | None:
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW)
         st = os.fstat(fd)
+        # Every decision below is taken on the descriptor we are about to read,
+        # never on the pathname. Re-opening a path after checking it is the TOCTOU
+        # race the marketplace reviewer rejects even when the checks themselves
+        # are correct.
         if not stat.S_ISREG(st.st_mode):
+            return None
+        # A regular file with more than one link is reachable under a name we did
+        # not vet. Refuse rather than read something a hard link redirected.
+        if st.st_nlink != 1:
             return None
         # Root-owned files are the packaged system skills (Omarchy ships its own
         # under /usr/share). Refusing them would silently drop every distro skill.
         # What we refuse is a file owned by some other unprivileged user.
         if st.st_uid not in (os.getuid(), 0):
             return None
+        # World-writable means anyone on the machine chooses what we parse.
+        if st.st_mode & stat.S_IWOTH:
+            return None
         if st.st_size > max_bytes:
             return None
         os.set_blocking(fd, True)
-        return os.read(fd, max_bytes)
+        # Read to st_size rather than trusting one os.read(). A short read would
+        # otherwise hand back a prefix that parses as a whole, valid document.
+        chunks = []
+        remaining = st.st_size
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
     except OSError as exc:
         if exc.errno not in (errno.ENOENT, errno.ELOOP, errno.EACCES, errno.ENOTDIR, errno.EAGAIN):
             warn(f"read {path}: {exc}")
@@ -83,6 +113,12 @@ def read_json(path: str) -> tuple[dict | list | None, str | None]:
         return json.loads(txt), None
     except json.JSONDecodeError as exc:
         return None, f"invalid json at line {exc.lineno}"
+    except RecursionError:
+        # Deeply nested JSON blows the C parser's stack. The docstring promises a
+        # finding; without this it was an exit-1 traceback and an empty stdout.
+        return None, "json nested too deeply"
+    except (ValueError, MemoryError) as exc:
+        return None, f"unreadable json: {type(exc).__name__}"
 
 
 def read_toml(path: str) -> tuple[dict | None, str | None]:
@@ -94,6 +130,45 @@ def read_toml(path: str) -> tuple[dict | None, str | None]:
         return tomllib.loads(raw.decode("utf-8", "replace")), None
     except Exception as exc:  # noqa: BLE001 - any parse failure is one finding
         return None, f"invalid toml: {exc}"
+
+
+# A URL query string, a --header argument or an --api-key flag in an MCP command
+# line is a credential. The panel draws `target`, so anything secret-shaped is
+# replaced here, in the only process that ever sees the original.
+SECRET_FLAG = re.compile(
+    r"(?i)(--?(?:header|token|api[-_]?key|password|secret|auth[a-z-]*)[= ])\S+")
+SECRET_ENVISH = re.compile(r"(?i)\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*=)\S+")
+
+
+def redact(text) -> str:
+    out = clip(text, 512)
+    try:
+        parts = out.split("?", 1)
+        if len(parts) == 2 and "://" in parts[0]:
+            out = parts[0] + "?\u2026"
+    except Exception:
+        pass
+    out = SECRET_FLAG.sub("\\1\u2026", out)
+    out = SECRET_ENVISH.sub("\\1\u2026", out)
+    return out
+
+
+def as_dict(value) -> dict:
+    """A config file is user-editable, so every value is the wrong type sooner
+    or later. `(x or {})` still hands back a str for {"mcp": "nope"} and the next
+    .items() raises; this refuses anything that is not a mapping."""
+    return value if isinstance(value, dict) else {}
+
+
+def as_list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def clip(text, limit: int = 512) -> str:
+    """Cap every third-party string before it crosses into the shell process."""
+    out = "" if text is None else str(text)
+    out = "".join(ch for ch in out if ch == "\t" or ch >= " ")
+    return out if len(out) <= limit else out[:limit - 1] + "\u2026"
 
 
 def warn(msg: str) -> None:
@@ -368,18 +443,19 @@ def token_estimate(name: str, description: str, when_to_use: str, divisor: int =
 
 def scan(divisor: int = 4) -> dict:
     started = time.monotonic()
+    deadline = started + DEADLINE_SECONDS
     findings: list[dict] = []
     by_real: dict[str, dict] = {}
 
     claude_settings, err = read_json(f"{HOME}/.claude/settings.json")
     if err:
         findings.append({"what": "claude settings.json", "detail": err})
-    overrides = (claude_settings or {}).get("skillOverrides") or {}
+    overrides = as_dict(as_dict(claude_settings).get("skillOverrides"))
 
     claude_state, err = read_json(f"{HOME}/.claude.json")
     if err:
         findings.append({"what": "claude.json", "detail": err})
-    usage = (claude_state or {}).get("skillUsage") or {}
+    usage = as_dict(as_dict(claude_state).get("skillUsage"))
 
     catalog_cat = _catalog_categories()
 
@@ -389,7 +465,17 @@ def scan(divisor: int = 4) -> dict:
             entries = sorted(os.scandir(base), key=lambda e: e.name)
         except OSError:
             continue
+        if len(entries) > MAX_DIR_ENTRIES:
+            findings.append({"what": tilde(base),
+                             "detail": f"{len(entries)} entries, reading the first {MAX_DIR_ENTRIES}"})
+            entries = entries[:MAX_DIR_ENTRIES]
         for entry in entries:
+            if time.monotonic() > deadline:
+                findings.append({"what": tilde(base), "detail": "scan deadline reached, listing is partial"})
+                break
+            if len(by_real) >= MAX_ITEMS:
+                findings.append({"what": "inventory", "detail": f"capped at {MAX_ITEMS} items"})
+                break
             if entry.name.startswith("."):
                 if entry.name != ".system":
                     continue
@@ -485,9 +571,9 @@ def _ingest(by_real, dir_path, base, root, overrides, usage, catalog_cat,
         "realPath": real,
         "contentHash": "sha256:" + hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16],
         "kind": "skill",
-        "displayName": display,
-        "dirName": dir_name,
-        "description": description,
+        "displayName": clip(display, 128),
+        "dirName": clip(dir_name, 128),
+        "description": clip(description, 1024),
         "scope": "bundled" if bundled else root["scope"],
         "linkage": "symlink" if is_link else "real",
         "mounts": [{"tool": t, "path": mount_path, "link": "symlink" if is_link else "real"}
@@ -556,8 +642,8 @@ def _catalog_categories() -> dict:
     out: dict[str, str] = {}
     if not isinstance(data, dict):
         return out
-    for entry in (data.get("catalog", {}).get("plugins") or {}).values():
-        me = entry.get("marketplace_entry") or {}
+    for entry in as_dict(as_dict(data.get("catalog")).get("plugins")).values():
+        me = as_dict(as_dict(entry).get("marketplace_entry"))
         if me.get("name") and me.get("category"):
             out[me["name"]] = me["category"]
     return out
@@ -571,41 +657,46 @@ def scan_mcp(findings: list[dict]) -> list[dict]:
     oc, err = read_json(f"{HOME}/.config/opencode/opencode.json")
     if err:
         findings.append({"what": "opencode.json", "detail": err})
-    for name, cfg in ((oc or {}).get("mcp") or {}).items():
+    for name, cfg in as_dict(as_dict(oc).get("mcp")).items():
+        cfg = as_dict(cfg)
         servers.append({
-            "kind": "mcp", "tool": "opencode", "name": name,
-            "transport": cfg.get("type", "local"),
-            "target": cfg.get("url") or " ".join(cfg.get("command") or []),
-            "enabled": cfg.get("enabled", True), "scope": "user",
+            "kind": "mcp", "tool": "opencode", "name": clip(name, 128),
+            "transport": clip(cfg.get("type", "local"), 32),
+            "target": redact(cfg.get("url") or " ".join(str(a) for a in as_list(cfg.get("command")))),
+            "enabled": cfg.get("enabled", True) is not False, "scope": "user",
             "auth": _opencode_auth(name), "writable": False,
         })
 
     cx, err = read_toml(f"{HOME}/.codex/config.toml")
     if err:
         findings.append({"what": "codex config.toml", "detail": err})
-    for name, cfg in ((cx or {}).get("mcp_servers") or {}).items():
+    for name, cfg in as_dict(as_dict(cx).get("mcp_servers")).items():
+        cfg = as_dict(cfg)
+        argv = [str(cfg.get("command", ""))] + [str(a) for a in as_list(cfg.get("args"))]
         servers.append({
-            "kind": "mcp", "tool": "codex", "name": name, "transport": "stdio",
-            "target": " ".join([cfg.get("command", "")] + list(cfg.get("args") or [])).strip(),
-            "enabled": cfg.get("enabled", True), "scope": "user",
+            "kind": "mcp", "tool": "codex", "name": clip(name, 128), "transport": "stdio",
+            "target": redact(" ".join(argv).strip()),
+            "enabled": cfg.get("enabled", True) is not False, "scope": "user",
             "auth": "unknown", "writable": False,
         })
 
     state, _ = read_json(f"{HOME}/.claude.json")
-    for name, cfg in ((state or {}).get("mcpServers") or {}).items():
+    for name, cfg in as_dict(as_dict(state).get("mcpServers")).items():
+        cfg = as_dict(cfg)
+        argv = [str(cfg.get("command", ""))] + [str(a) for a in as_list(cfg.get("args"))]
         servers.append({
-            "kind": "mcp", "tool": "claude", "name": name,
-            "transport": cfg.get("type", "stdio"),
-            "target": cfg.get("url") or " ".join([cfg.get("command", "")] + list(cfg.get("args") or [])),
+            "kind": "mcp", "tool": "claude", "name": clip(name, 128),
+            "transport": clip(cfg.get("type", "stdio"), 32),
+            "target": redact(cfg.get("url") or " ".join(argv).strip()),
             "enabled": True, "scope": "user", "auth": "unknown", "writable": False,
         })
 
     # claude.ai connectors are not on disk. Live state needs the API; the names
     # survive offline in claudeAiMcpEverConnected, which is why this degrades to
     # a greyed list rather than an empty one.
-    for name in (state or {}).get("claudeAiMcpEverConnected") or []:
+    for name in as_list(as_dict(state).get("claudeAiMcpEverConnected")):
         servers.append({
-            "kind": "mcp", "tool": "claude", "name": name, "transport": "http",
+            "kind": "mcp", "tool": "claude", "name": clip(name, 128), "transport": "http",
             "target": "", "enabled": None, "scope": "account",
             "auth": "unknown", "writable": False, "source": "claudeAiMcpEverConnected",
         })
@@ -614,10 +705,10 @@ def scan_mcp(findings: list[dict]) -> list[dict]:
 
 def _opencode_auth(name: str) -> str:
     data, _ = read_json(f"{HOME}/.local/share/opencode/mcp-auth.json")
-    entry = (data or {}).get(name)
+    entry = as_dict(as_dict(data).get(name))
     if not entry:
         return "unknown"
-    expires = ((entry.get("tokens") or {}).get("expiresAt") or 0)
+    expires = as_dict(entry.get("tokens")).get("expiresAt") or 0
     return "connected" if expires > time.time() else "expired"
 
 
@@ -626,12 +717,13 @@ def scan_claude_plugins(findings: list[dict]) -> list[dict]:
     if err:
         findings.append({"what": "installed_plugins.json", "detail": err})
     settings, _ = read_json(f"{HOME}/.claude/settings.json")
-    enabled = (settings or {}).get("enabledPlugins") or {}
+    enabled = as_dict(as_dict(settings).get("enabledPlugins"))
     out = []
-    for pid, records in ((installed or {}).get("plugins") or {}).items():
-        for rec in records:
+    for pid, records in as_dict(as_dict(installed).get("plugins")).items():
+        for rec in as_list(records):
+            rec = as_dict(rec)
             out.append({
-                "kind": "plugin", "tool": "claude", "name": pid,
+                "kind": "plugin", "tool": "claude", "name": clip(pid, 128),
                 "version": rec.get("version"), "scope": rec.get("scope", "user"),
                 "enabled": enabled.get(pid, True), "installPath": rec.get("installPath"),
                 "origin": {"type": "marketplace", "installedSha": rec.get("gitCommitSha")},
@@ -673,8 +765,20 @@ def main(argv: list[str]) -> int:
 
     if args.cmd == "scan":
         result = scan(divisor=args.divisor)
-        json.dump(result, sys.stdout, indent=2 if args.pretty else None, ensure_ascii=False)
-        sys.stdout.write("\n")
+        payload = json.dumps(result, indent=2 if args.pretty else None, ensure_ascii=False)
+        if len(payload.encode("utf-8")) > MAX_OUTPUT:
+            # Refuse rather than emit a truncated document the reader would parse
+            # as a whole one. The caller gets a valid, small, honest answer.
+            warn(f"scan output exceeded {MAX_OUTPUT} bytes; refusing to emit it")
+            payload = json.dumps({
+                "version": VERSION, "generatedAt": result["generatedAt"],
+                "items": [], "mcp": [], "plugins": [], "counts": result["counts"],
+                "findings": [{"what": "inventory",
+                              "detail": "too large to return; run agent-ext doctor in a terminal"}],
+            }, ensure_ascii=False)
+            sys.stdout.write(payload + "\n")
+            return 2
+        sys.stdout.write(payload + "\n")
         return 0
 
     if args.cmd == "doctor":
